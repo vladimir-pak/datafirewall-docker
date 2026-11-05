@@ -1,0 +1,527 @@
+name: datafirewall
+
+# This stack demonstrates Flink HA across processes/containers on ONE Docker host.
+# It does not survive failure of the Docker host; see README.md for multi-host guidance.
+
+x-flink-properties: &flink-properties |
+  # Scheduling
+  taskmanager.load-balance.mode: SLOTS
+
+  # HA (three ZooKeeper peers and two JobManagers)
+  high-availability.type: zookeeper
+  high-availability.cluster-id: flink-cluster
+  high-availability.storageDir: s3://flink/ha/metadata
+  high-availability.jobmanager.port: 6123
+  high-availability.zookeeper.quorum: zk1:2181,zk2:2181,zk3:2181
+  high-availability.zookeeper.path.root: /flink
+  high-availability.zookeeper.client.acl: open
+  high-availability.zookeeper.client.session-timeout: 45s
+  high-availability.zookeeper.client.connection-timeout: 15s
+  high-availability.zookeeper.client.tolerate-suspended-connections: true
+
+  # Restart and throughput
+  restart-strategy.type: exponential-delay
+  restart-strategy.exponential-delay.initial-backoff: 5s
+  restart-strategy.exponential-delay.max-backoff: 2min
+  restart-strategy.exponential-delay.backoff-multiplier: 2.0
+  restart-strategy.exponential-delay.reset-backoff-threshold: 10min
+  restart-strategy.exponential-delay.jitter-factor: 0.1
+  execution.buffer-timeout.enabled: true
+  execution.buffer-timeout.interval: 100ms
+
+  # Checkpointing and state
+  execution.checkpointing.interval: 60s
+  execution.checkpointing.timeout: 2min
+  execution.checkpointing.min-pause: 10s
+  execution.checkpointing.max-concurrent-checkpoints: 1
+  execution.checkpointing.tolerable-failed-checkpoints: 3
+  execution.checkpointing.externalized-checkpoint-retention: RETAIN_ON_CANCELLATION
+  execution.checkpointing.mode: EXACTLY_ONCE
+  execution.checkpointing.unaligned.enabled: true
+  execution.checkpointing.aligned-checkpoint-timeout: 30s
+  execution.checkpointing.storage: filesystem
+  execution.checkpointing.dir: s3://flink/ha/checkpoints
+  execution.checkpointing.savepoint-dir: s3://flink/ha/savepoints
+  execution.checkpointing.incremental: true
+  execution.checkpointing.num-retained: 3
+  execution.checkpointing.local-backup.enabled: true
+  state.backend.type: rocksdb
+  io.tmp.dirs: /opt/flink/local-state/tmp
+  execution.checkpointing.local-backup.dirs: /opt/flink/local-state/backup
+
+  # MinIO S3: internal Docker DNS, HTTP for local HA test only
+  s3.endpoint: http://minio:9000
+  s3.path.style.access: true
+  s3.access-key: ${MINIO_ROOT_USER:?Set MINIO_ROOT_USER}
+  s3.secret-key: ${MINIO_ROOT_PASSWORD:?Set MINIO_ROOT_PASSWORD}
+
+  # Resource settings - adjust for available RAM/CPU
+  jobmanager.memory.process.size: ${FLINK_JM_MEMORY:-1024m}
+  taskmanager.memory.process.size: ${FLINK_TM_MEMORY:-2g}
+  taskmanager.numberOfTaskSlots: ${FLINK_TM_SLOTS:-2}
+  parallelism.default: ${FLINK_PARALLELISM:-2}
+  jobmanager.bind-host: 0.0.0.0
+  taskmanager.bind-host: 0.0.0.0
+  rest.bind-address: 0.0.0.0
+  rest.port: 8081-8083
+
+x-flink-common: &flink-common
+  image: datafirewall/flink:1.20.3-custom
+  build:
+    context: .
+    dockerfile: docker/flink/Dockerfile
+  pull_policy: build
+  restart: unless-stopped
+  environment:
+    FLINK_PROPERTIES: *flink-properties
+  networks: [datafirewall]
+  depends_on:
+    postgres:
+      condition: service_healthy
+    minio-init:
+      condition: service_completed_successfully
+    zk1:
+      condition: service_started
+    zk2:
+      condition: service_started
+    zk3:
+      condition: service_started
+  volumes:
+    - ./jobs:/opt/flink/usrlib:ro
+
+x-zookeeper-common: &zookeeper-common
+  image: zookeeper:3.9.3
+  restart: unless-stopped
+  networks: [datafirewall]
+  environment:
+    ZOO_SERVERS: 'server.1=zk1:2888:3888;2181 server.2=zk2:2888:3888;2181 server.3=zk3:2888:3888;2181'
+    ZOO_4LW_COMMANDS_WHITELIST: 'ruok,stat,mntr,conf'
+    JVMFLAGS: '-Xms128m -Xmx256m'
+
+services:
+  # Phase 1: DATABASE. Other services wait until DDL + DML completed.
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-datafirewall}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./postgres/init:/docker-entrypoint-initdb.d:ro
+    ports:
+      - '127.0.0.1:5432:5432'
+    networks: [datafirewall]
+    healthcheck:
+      # This marker is added at the END of 02-dml.sql. pg_isready alone is insufficient.
+      test:
+        - CMD-SHELL
+        - >-
+          PGPASSWORD="$$POSTGRES_PASSWORD" psql -U "$$POSTGRES_USER" -d "$$POSTGRES_DB"
+          -tAc "SELECT to_regclass('public.dfw_bootstrap') IS NOT NULL"
+          2>/dev/null | grep -qx t
+          && PGPASSWORD="$$POSTGRES_PASSWORD" psql -U "$$POSTGRES_USER" -d "$$POSTGRES_DB"
+          -tAc "SELECT EXISTS (SELECT 1 FROM public.dfw_bootstrap WHERE stage = 'dml')"
+          2>/dev/null | grep -qx t
+      interval: 5s
+      timeout: 5s
+      retries: 36
+      start_period: 15s
+
+  # Phase 2: infrastructure
+  ignite:
+    build:
+      context: .
+      dockerfile: docker/ignite/Dockerfile
+    restart: unless-stopped
+    environment:
+      APP_PATH: /app
+      APP_VERSION: 'debug'
+      SERVER_ADDRESS: 0.0.0.0
+      SERVER_PORT: '9900'
+      IGNITE_INSTANCE_NAME: ignite-server-a
+      IGNITE_CONSISTENT_ID: ignite-server-a
+      IGNITE_LOCAL_HOST: ignite
+      IGNITE_WORK_DIRECTORY: /data/ignite/work
+      IGNITE_DISCOVERY_ADDRESSES_0: ignite:47500..47520
+      IGNITE_DISCOVERY_LOCAL_PORT: '47500'
+      IGNITE_DISCOVERY_LOCAL_PORT_RANGE: '20'
+      IGNITE_COMMUNICATION_LOCAL_PORT: '47100'
+      IGNITE_COMMUNICATION_LOCAL_PORT_RANGE: '20'
+      IGNITE_THIN_CLIENT_HOST: 0.0.0.0
+      IGNITE_THIN_CLIENT_PORT: '10800'
+      IGNITE_AUTHENTICATION_ENABLED: 'true'
+      IGNITE_PERSISTENCE_ENABLED: 'true'
+      IGNITE_PERSISTENCE_STORAGE_PATH: /data/ignite/data/storage
+      IGNITE_PERSISTENCE_WAL_PATH: /data/ignite/data/wal
+      IGNITE_PERSISTENCE_WAL_ARCHIVE_PATH: /data/ignite/data/wal-archive
+      IGNITE_DATA_REGION_NAME: Default_Region
+      IGNITE_DATA_REGION_INITIAL_SIZE_MB: '512'
+      IGNITE_DATA_REGION_MAX_SIZE_MB: '2048'
+      IGNITE_USER: ${IGNITE_USER:-ignite}
+      IGNITE_PASSWORD: ${IGNITE_PASSWORD:-ignite}
+      LOGS_DB_URL: jdbc:postgresql://postgres:5432/${POSTGRES_DB:-datafirewall}
+      LOGS_DB_USER: postgres
+      LOGS_DB_PASSWORD: postgres
+      JAVA_TOOL_OPTIONS: >-
+        -Xms512m -Xmx2g
+        --add-opens=java.base/jdk.internal.access=ALL-UNNAMED
+        --add-opens=java.base/jdk.internal.misc=ALL-UNNAMED
+        --add-opens=java.base/sun.nio.ch=ALL-UNNAMED
+        --add-opens=java.base/sun.util.calendar=ALL-UNNAMED
+        --add-opens=java.management/com.sun.jmx.mbeanserver=ALL-UNNAMED
+        --add-opens=jdk.internal.jvmstat/sun.jvmstat.monitor=ALL-UNNAMED
+        --add-opens=java.base/sun.reflect.generics.reflectiveObjects=ALL-UNNAMED
+        --add-opens=jdk.management/com.sun.management.internal=ALL-UNNAMED
+        --add-opens=java.base/java.io=ALL-UNNAMED
+        --add-opens=java.base/java.nio=ALL-UNNAMED
+        --add-opens=java.base/java.net=ALL-UNNAMED
+        --add-opens=java.base/java.util=ALL-UNNAMED
+        --add-opens=java.base/java.util.concurrent=ALL-UNNAMED
+        --add-opens=java.base/java.util.concurrent.locks=ALL-UNNAMED
+        --add-opens=java.base/java.util.concurrent.atomic=ALL-UNNAMED
+        --add-opens=java.base/java.lang=ALL-UNNAMED
+        --add-opens=java.base/java.lang.invoke=ALL-UNNAMED
+        --add-opens=java.base/java.math=ALL-UNNAMED
+        --add-opens=java.sql/java.sql=ALL-UNNAMED
+        --add-opens=java.base/java.lang.reflect=ALL-UNNAMED
+        --add-opens=java.base/java.time=ALL-UNNAMED
+        --add-opens=java.base/java.text=ALL-UNNAMED
+        --add-opens=java.management/sun.management=ALL-UNNAMED
+        --add-opens=java.desktop/java.awt.font=ALL-UNNAMED
+    volumes:
+      - ignite-data:/data/ignite
+      - ignite-logs:/app/logs
+    ports:
+      - '127.0.0.1:9901:9900'  # Ignite REST; Spring API uses host port 9900
+      - '127.0.0.1:10800:10800'
+    networks: [datafirewall]
+    depends_on:
+      postgres: {condition: service_healthy}
+
+  kafka:
+    image: apache/kafka:3.9.1
+    hostname: kafka
+    restart: unless-stopped
+    entrypoint: ['/bin/bash', '/opt/datafirewall/kafka-start.sh']
+    environment:
+      KAFKA_CLUSTER_ID: ${KAFKA_CLUSTER_ID:-4L6g3nShT-eMCtK--X86sw}
+      KAFKA_EXTERNAL_HOST: ${KAFKA_EXTERNAL_HOST:-localhost}
+      KAFKA_USERNAME: ${KAFKA_USER:-kafka}
+      KAFKA_PASSWORD: ${KAFKA_PASSWORD:-kafka}
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+      - ./docker/kafka/kafka-start.sh:/opt/datafirewall/kafka-start.sh:ro
+      - ./docker/kafka/client.properties:/opt/datafirewall/client.properties:ro
+    ports:
+      - '127.0.0.1:9094:9094'
+    networks: [datafirewall]
+    depends_on:
+      postgres: {condition: service_healthy}
+    healthcheck:
+      test: ['CMD-SHELL', '/opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --command-config /opt/datafirewall/client.properties --list >/dev/null 2>&1']
+      interval: 10s
+      timeout: 8s
+      retries: 30
+      start_period: 20s
+
+  kafka-init:
+    image: apache/kafka:3.9.1
+    restart: 'no'
+    entrypoint: ['/bin/bash', '-ec']
+    command:
+      - |
+        set -e
+        for topic in rules-update processing-audit cef-audit; do
+          partitions=3
+          if [[ "$$topic" == 'rules-update' ]]; then partitions=1; fi
+          /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --command-config /opt/datafirewall/client.properties \
+            --create --if-not-exists --topic "$$topic" --partitions "$$partitions" --replication-factor 1
+        done
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --command-config /opt/datafirewall/client.properties --list
+    volumes:
+      - ./docker/kafka/client.properties:/opt/datafirewall/client.properties:ro
+    depends_on:
+      kafka: {condition: service_healthy}
+    networks: [datafirewall]
+
+  artemis:
+    image: apache/activemq-artemis:2.42.0
+    restart: unless-stopped
+    environment:
+      ARTEMIS_USER: ${ARTEMIS_USER:-artemis}
+      ARTEMIS_PASSWORD: ${ARTEMIS_PASSWORD:-artemis}
+      ANONYMOUS_LOGIN: 'false'
+      # --queues is applied when the Artemis instance is first created.
+      EXTRA_ARGS: '--http-host 0.0.0.0 --relax-jolokia --queues datafirewall.in,datafirewall.out'
+    volumes:
+      - artemis-data:/var/lib/artemis-instance
+    ports:
+      - '127.0.0.1:61616:61616'
+      - '127.0.0.1:8161:8161'
+    networks: [datafirewall]
+    depends_on:
+      postgres: {condition: service_healthy}
+    healthcheck:
+      test: ['CMD-SHELL', 'bash -c "echo >/dev/tcp/127.0.0.1/61616"']
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 15s
+
+  minio:
+    image: cgr.dev/chainguard/minio:latest
+    command: server /data --console-address ':9001'
+    restart: unless-stopped
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    volumes:
+      - minio-data:/data
+    ports:
+      - '127.0.0.1:8333:9000'
+      - '127.0.0.1:9001:9001'
+    networks: [datafirewall]
+    depends_on:
+      postgres: {condition: service_healthy}
+    healthcheck:
+      test: ['CMD', 'mc', 'ready', 'local']
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 10s
+
+  minio-init:
+    image: cgr.dev/chainguard/minio-client:latest-dev
+    restart: 'no'
+    entrypoint: ['/bin/sh', '-ec']
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      MC_CONFIG_DIR: /tmp/.mc
+    command:
+      - |
+        until mc alias set storage http://minio:9000 "$$MINIO_ROOT_USER" "$$MINIO_ROOT_PASSWORD"; do sleep 2; done
+        mc mb --ignore-existing storage/flink
+    depends_on:
+      minio: {condition: service_healthy}
+    networks: [datafirewall]
+
+  zk1:
+    <<: *zookeeper-common
+    hostname: zk1
+    environment:
+      ZOO_MY_ID: '1'
+      ZOO_SERVERS: 'server.1=zk1:2888:3888;2181 server.2=zk2:2888:3888;2181 server.3=zk3:2888:3888;2181'
+      ZOO_4LW_COMMANDS_WHITELIST: 'ruok,stat,mntr,conf'
+      JVMFLAGS: '-Xms128m -Xmx256m'
+    depends_on:
+      postgres: {condition: service_healthy}
+    volumes: [zk1-data:/data, zk1-log:/datalog]
+
+  zk2:
+    <<: *zookeeper-common
+    hostname: zk2
+    environment:
+      ZOO_MY_ID: '2'
+      ZOO_SERVERS: 'server.1=zk1:2888:3888;2181 server.2=zk2:2888:3888;2181 server.3=zk3:2888:3888;2181'
+      ZOO_4LW_COMMANDS_WHITELIST: 'ruok,stat,mntr,conf'
+      JVMFLAGS: '-Xms128m -Xmx256m'
+    depends_on:
+      postgres: {condition: service_healthy}
+    volumes: [zk2-data:/data, zk2-log:/datalog]
+
+  zk3:
+    <<: *zookeeper-common
+    hostname: zk3
+    environment:
+      ZOO_MY_ID: '3'
+      ZOO_SERVERS: 'server.1=zk1:2888:3888;2181 server.2=zk2:2888:3888;2181 server.3=zk3:2888:3888;2181'
+      ZOO_4LW_COMMANDS_WHITELIST: 'ruok,stat,mntr,conf'
+      JVMFLAGS: '-Xms128m -Xmx256m'
+    depends_on:
+      postgres: {condition: service_healthy}
+    volumes: [zk3-data:/data, zk3-log:/datalog]
+
+  # Phase 3: Java microservices (Spring 9200, Ignite 9900, Kafka reader 9800, JMS 9800).
+  spring-api:
+    build: {context: ., dockerfile: docker/spring/Dockerfile}
+    restart: unless-stopped
+    environment:
+      APP_PATH: /app
+      APP_VERSION: 'debug'
+      SERVER_ADDRESS: 0.0.0.0
+      SERVER_PORT: '9200'
+      DATASOURCE_DB_URL: jdbc:postgresql://postgres:5432/${POSTGRES_DB:-datafirewall}
+      DATASOURCE_DB_USER: postgres
+      DATASOURCE_DB_PASSWORD: postgres
+      FLYWAY_DB_URL: jdbc:postgresql://postgres:5432/${POSTGRES_DB:-datafirewall}
+      FLYWAY_DB_USER: postgres
+      FLYWAY_DB_PASSWORD: postgres
+      LOGS_DB_URL: jdbc:postgresql://postgres:5432/${POSTGRES_DB:-datafirewall}
+      LOGS_DB_USER: postgres
+      LOGS_DB_PASSWORD: postgres
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      SPRING_KAFKA_CACHE_UPDATE_ENABLED: 'true'
+      SPRING_KAFKA_TOPICS_CACHE_UPDATE: rules-update
+      KAFKA_USERNAME: ${KAFKA_USER:-kafka}
+      KAFKA_PASSWORD: ${KAFKA_PASSWORD:-kafka}
+      IGNITE_THIN_ADDRESSES_0: ignite:10800
+      IGNITE_USER: ${IGNITE_USER:-ignite}
+      IGNITE_PASSWORD: ${IGNITE_PASSWORD:-ignite}
+      JWT_SECRET: ${JWT_SECRET:-nQ1O6UXZox/Qm4NdCAjrdO3a5evCyUr6IbeB31L/BPQ=}
+      JAVA_TOOL_OPTIONS: >-
+        -Xms512m -Xmx2g
+        --add-opens=java.base/jdk.internal.access=ALL-UNNAMED
+        --add-opens=java.base/jdk.internal.misc=ALL-UNNAMED
+        --add-opens=java.base/sun.nio.ch=ALL-UNNAMED
+        --add-opens=java.base/sun.util.calendar=ALL-UNNAMED
+        --add-opens=java.management/com.sun.jmx.mbeanserver=ALL-UNNAMED
+        --add-opens=jdk.internal.jvmstat/sun.jvmstat.monitor=ALL-UNNAMED
+        --add-opens=java.base/sun.reflect.generics.reflectiveObjects=ALL-UNNAMED
+        --add-opens=jdk.management/com.sun.management.internal=ALL-UNNAMED
+        --add-opens=java.base/java.io=ALL-UNNAMED
+        --add-opens=java.base/java.nio=ALL-UNNAMED
+        --add-opens=java.base/java.net=ALL-UNNAMED
+        --add-opens=java.base/java.util=ALL-UNNAMED
+        --add-opens=java.base/java.util.concurrent=ALL-UNNAMED
+        --add-opens=java.base/java.util.concurrent.locks=ALL-UNNAMED
+        --add-opens=java.base/java.util.concurrent.atomic=ALL-UNNAMED
+        --add-opens=java.base/java.lang=ALL-UNNAMED
+        --add-opens=java.base/java.lang.invoke=ALL-UNNAMED
+        --add-opens=java.base/java.math=ALL-UNNAMED
+        --add-opens=java.sql/java.sql=ALL-UNNAMED
+        --add-opens=java.base/java.lang.reflect=ALL-UNNAMED
+        --add-opens=java.base/java.time=ALL-UNNAMED
+        --add-opens=java.base/java.text=ALL-UNNAMED
+        --add-opens=java.management/sun.management=ALL-UNNAMED
+        --add-opens=java.desktop/java.awt.font=ALL-UNNAMED
+    volumes: [spring-logs:/app/logs]
+    ports:
+      - '9900:9200'   # Keep requested external spring REST port 9900
+    networks: [datafirewall]
+    depends_on:
+      postgres: {condition: service_healthy}
+      kafka-init: {condition: service_completed_successfully}
+      ignite: {condition: service_started}
+
+  datafirewall-kafka:
+    build: {context: ., dockerfile: docker/kafka-reader/Dockerfile}
+    restart: unless-stopped
+    environment:
+      APP_PATH: /app
+      APP_VERSION: 'debug'
+      SERVER_ADDRESS: 0.0.0.0
+      SERVER_PORT: '9800'
+      DATASOURCE_DB_URL: jdbc:postgresql://postgres:5432/${POSTGRES_DB:-datafirewall}
+      DATASOURCE_DB_USER: postgres
+      DATASOURCE_DB_PASSWORD: postgres
+      FLYWAY_DB_URL: jdbc:postgresql://postgres:5432/${POSTGRES_DB:-datafirewall}
+      FLYWAY_DB_USER: postgres
+      FLYWAY_DB_PASSWORD: postgres
+      LOGS_DB_URL: jdbc:postgresql://postgres:5432/${POSTGRES_DB:-datafirewall}
+      LOGS_DB_USER: postgres
+      LOGS_DB_PASSWORD: postgres
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      SPRING_KAFKA_CONSUMER_GROUP_ID: dfw-kafka-service
+      KAFKA_USERNAME: ${KAFKA_USER:-kafka}
+      KAFKA_PASSWORD: ${KAFKA_PASSWORD:-kafka}
+      APP_KAFKA_TOPIC: processing-audit
+      APP_KAFKA_AUDIT_TOPIC: cef-audit
+      APP_KAFKA_ADMIN_FAIL_FAST: 'true'
+      APP_JOURNAL_SCHEMA: datafirewall
+      APP_JOURNAL_TABLE: datafirewall_journal
+      APP_JOURNAL_AUDIT_TABLE: dq_audit.datafirewall_flink_log
+    volumes: [kafka-reader-logs:/app/logs]
+    ports:
+      - '9801:9800'   # Internal 9800 retained, external 9800 belongs to jms-publisher
+    networks: [datafirewall]
+    depends_on:
+      postgres: {condition: service_healthy}
+      kafka-init: {condition: service_completed_successfully}
+
+  jms-publisher:
+    build: {context: ., dockerfile: docker/jms-publisher/Dockerfile}
+    restart: unless-stopped
+    environment:
+      SERVER_ADDRESS: 0.0.0.0
+      SERVER_PORT: '9800'
+      SPRING_ARTEMIS_MODE: native
+      SPRING_ARTEMIS_BROKER_URL: tcp://artemis:61616
+      SPRING_ARTEMIS_USER: ${ARTEMIS_USER:-artemis}
+      SPRING_ARTEMIS_PASSWORD: ${ARTEMIS_PASSWORD:-artemis}
+      # Spring's Artemis config is a best-effort default; no application.yaml supplied.
+    ports:
+      - '9800:9800'
+    networks: [datafirewall]
+    depends_on:
+      postgres: {condition: service_healthy}
+      artemis: {condition: service_healthy}
+
+  # Phase 4: Flink HA cluster, 2 JobManagers + 2 TaskManagers.
+  flink-jm1:
+    <<: *flink-common
+    hostname: flink-jm1
+    command: jobmanager
+    ports: ['127.0.0.1:8081:8081']
+
+  flink-jm2:
+    <<: *flink-common
+    hostname: flink-jm2
+    command: jobmanager
+    ports: ['127.0.0.1:8082:8081']
+
+  flink-jm3:
+    <<: *flink-common
+    hostname: flink-jm3
+    command: jobmanager
+    ports: ['127.0.0.1:8083:8081']
+
+  flink-tm1:
+    <<: *flink-common
+    hostname: flink-tm1
+    command: taskmanager
+    volumes:
+      - ./jobs:/opt/flink/usrlib:ro
+      - flink-tm1-data:/opt/flink/local-state
+
+  flink-tm2:
+    <<: *flink-common
+    hostname: flink-tm2
+    command: taskmanager
+    volumes:
+      - ./jobs:/opt/flink/usrlib:ro
+      - flink-tm2-data:/opt/flink/local-state
+
+  flink-tm3:
+    <<: *flink-common
+    hostname: flink-tm3
+    command: taskmanager
+    volumes:
+      - ./jobs:/opt/flink/usrlib:ro
+      - flink-tm3-data:/opt/flink/local-state
+
+
+networks:
+  datafirewall:
+    driver: bridge
+
+volumes:
+  postgres-data:
+  ignite-data:
+  ignite-logs:
+  kafka-data:
+  kafka-reader-logs:
+  spring-logs:
+  artemis-data:
+  minio-data:
+  zk1-data:
+  zk1-log:
+  zk2-data:
+  zk2-log:
+  zk3-data:
+  zk3-log:
+  flink-tm1-data:
+  flink-tm2-data:
+  flink-tm3-data:

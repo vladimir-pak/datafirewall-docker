@@ -1,0 +1,99 @@
+
+# ==========================
+# macOS
+# ==========================
+.DS_Store
+**/.DS_Store
+.AppleDouble
+.LSOverride
+._*
+__MACOSX/
+**/__MACOSX/
+
+# ==========================
+# Java
+# ==========================
+*.class
+*.jar
+*.war
+*.ear
+*.log
+hs_err_pid*
+replay_pid*
+
+# ==========================
+# Maven
+# ==========================
+target/
+.mvn/timing.properties
+.mvn/wrapper/maven-wrapper.jar
+pom.xml.tag
+pom.xml.releaseBackup
+pom.xml.versionsBackup
+pom.xml.next
+release.properties
+dependency-reduced-pom.xml
+
+# ==========================
+# Gradle
+# ==========================
+.gradle/
+build/
+!gradle/wrapper/gradle-wrapper.jar
+
+# ==========================
+# IntelliJ IDEA
+# ==========================
+.idea/
+*.iml
+*.ipr
+*.iws
+out/
+
+# ==========================
+# Eclipse / STS
+# ==========================
+.project
+.classpath
+.settings/
+.springBeans
+.sts4-cache/
+
+# ==========================
+# VS Code
+# ==========================
+.vscode/
+
+# ==========================
+# Temporary files
+# ==========================
+*.tmp
+*.temp
+*.bak
+*.swp
+*.swo
+*~
+*.orig
+
+# ==========================
+# Logs
+# ==========================
+logs/
+log/
+
+# ==========================
+# Environment / Secrets
+# ==========================
+.env
+.env.*
+!.env.example
+*.jks
+*.p12
+*.pfx
+*.key
+
+# ==========================
+# Docker / Local runtime data
+# ==========================
+docker-data/
+data/

@@ -1,0 +1,92 @@
+server:
+  port: 9900
+
+spring:
+  application:
+    name: ignite-server-a
+    version: ${APP_VERSION}
+    project-name: MKD
+
+ignite:
+  work-directory: ${APP_PATH}/ignite/work
+
+  instance-name: ignite-server-a
+  consistent-id: ignite-server-a
+  local-host: localhost
+
+  cluster:
+    activate-on-start: true
+
+  discovery:
+    addresses:
+      - localhost:47500..47520
+    local-port: 47500
+    local-port-range: 20
+
+  communication:
+    local-port: 47100
+    local-port-range: 20
+
+  thin-client:
+    host: localhost
+    port: 10800
+    port-range: 100
+
+  ssl:
+    enabled: false
+    client-auth: true
+
+  authentication:
+    enabled: true
+
+  persistence:
+    enabled: true
+    storage-path: ${APP_PATH}/ignite/data/storage
+    wal-path: ${APP_PATH}/ignite/data/wal
+    wal-archive-path: ${APP_PATH}/ignite/data/wal-archive
+
+  data-region:
+    name: Default_Region
+    initial-size-mb: 512
+    max-size-mb: 2048
+
+logs-database:
+  enabled: true
+  task-create-partition: 0 0 0 * * ?
+  url: ${LOGS_DB_URL}
+  username: ${LOGS_DB_USER}
+  password: ${LOGS_DB_PASSWORD}
+  driverClassName: org.postgresql.Driver
+  table: "dq_audit.datafirewall_ignite_log"
+
+clean-database-logs:
+  # cron expression, to switch off put value '-'
+  task-cleaner-schedule: 0 0 * * * ?
+  # delete logs from db that older than X days
+  clean-period: 1080
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info
+  endpoint:
+    health:
+      probes:
+        enabled: true
+      show-details: always
+
+logging:
+  cef:
+    path: ${APP_PATH}/logs
+    fileName: cef.log
+    retention-days: 90
+  level:
+    root: INFO
+    org.hibernate.SQL: DEBUG
+    org.hibernate.engine.jdbc.connections.internal.DriverManagerConnectionProviderImpl: DEBUG
+    org.apache.flink: INFO
+    org.springframework.jdbc: WARN
+    com.gpb.replication.postgres: DEBUG
+    org.flywaydb: DEBUG
+  config: file:${APP_PATH}/config/logback-spring.xml
